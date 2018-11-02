@@ -1,0 +1,145 @@
+image: docker:18.02.0
+
+stages:
+  - build
+  - test-docker-image
+  - update-k8s-scripts
+  - deploy-to-dev
+  - tag-master-on-merge
+  - deploy-to-uat
+
+# When using dind, it's wise to use the overlayfs driver for
+# improved performance.  This for a release.
+variables:
+  DOCKER_DRIVER: overlay2
+  REGISTRY: 'docreg.gvllab.windstream.net'
+  IMAGE_TAG: 'docreg.gvllab.windstream.net/docker-nginx-helloworld:$CI_COMMIT_REF_NAME'
+  K8S_DEV_NAMESPACE: default
+  K8S_DEV_USER: gitlab
+
+docker-build:
+  before_script:
+    - docker login -u $DOCKUSR -p $DOCKPAS $REGISTRY
+  stage: build
+  tags:
+    - third-option
+  services:
+  - docker:dind
+   # dind means docker in docker
+  script:
+    - docker build . -t $IMAGE_TAG
+    - docker push $IMAGE_TAG
+
+test-docker-image:
+  image: docker:18.02.0
+  before_script:
+    - docker login -u $DOCKUSR -p $DOCKPAS $REGISTRY
+  stage: test-docker-image
+  tags:
+    - third-option
+  services:
+  - docker:dind
+   # dind means docker in docker
+  script:
+    - whoami
+    - docker pull $IMAGE_TAG
+    - docker run --rm -p 80:80 -d --name hello-world $IMAGE_TAG
+    - docker ps
+    - WEB_APP_IP=$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' hello-world)
+    - echo $WEB_APP_IP
+    - apk add --no-cache curl
+    - curl http://${WEB_APP_IP}:80
+    - RESPONSE=$(curl http://${WEB_APP_IP}:80)
+   # - (if [[ $RESPONSE = *"build"* ]]; then echo "It's there!" fi);
+  after_script:
+    - docker stop hello-world
+
+update-k8s-scripts:
+ image: ubuntu:latest
+ stage: update-k8s-scripts
+ tags:
+  - second-option
+#Create a new file from a template.  This new file will contain the actual version number that gets released.
+ script:
+  - cp nginx-deployment.yaml nginx-deployment-gitlab.yaml
+  - sed -i 's/$VERSION/'''"$CI_COMMIT_REF_NAME"''' /' nginx-deployment-gitlab.yaml
+  - cat nginx-deployment-gitlab.yaml
+ artifacts:
+   paths:
+     - nginx-deployment-gitlab.yaml
+
+k8s-deploy-Dev:
+ image: lwolf/kubectl_deployer:0.4
+ dependencies:
+   - update-k8s-scripts
+ tags:
+   - second-option
+ stage: deploy-to-dev
+ environment:
+     name: dev
+ script:
+   # CI_ENVIRONMENT_URL comes from the GitLab env section
+   - kubectl config set-cluster my-cluster --server=$CI_ENVIRONMENT_URL --insecure-skip-tls-verify=true
+   - kubectl config set-credentials $K8S_DEV_USER --token=$K8S_GITLAB_DEV_TOKEN
+   - kubectl config set-context default-context --namespace=$K8S_DEV_NAMESPACE --cluster=my-cluster --user=$K8S_DEV_USER
+   - kubectl config use-context default-context
+   - kubectl config view
+   - cat nginx-deployment-gitlab.yaml
+   - kubectl apply -f nginx-deployment-gitlab.yaml --as system:serviceaccount:default:$K8S_DEV_USER
+   - kubectl apply -f nginx-service.yaml --as system:serviceaccount:default:$K8S_DEV_USER
+
+tag-master-on-merge:
+ stage: tag-master-on-merge
+ tags:
+   - shell
+ only:
+   - master
+ except:
+   - tags
+ script:
+   # List tags
+   - whoami
+   - git tag
+   # Tag
+   - git clone git@gitlab.gvllab.windstream.net:polinchakb/docker-nginx-helloworld.git
+   - cd docker-nginx-helloworld
+   # Git the latest tag
+   - git tag --sort=-creatordate > latest-tag.txt
+   # Put the last version number in $line
+   - line=$(head -n 1 latest-tag.txt)
+   - version=$(echo $line | grep -o '[^-]*$')
+   - major=$(echo $version | cut -d. -f1)
+   - minor=$(echo $version | cut -d. -f2)
+   - micro=$(echo $version | cut -d. -f3)
+   - a=1
+   # Add one to the version
+   - c=`echo $a + $minor | bc`
+   - echo new minor $c
+   - new_version="$major.$c.$micro"
+   - echo new version $new_version
+   - git tag -a $new_version -m "New version $new_version being tagged by GitLab pipeline."
+   - git pull origin master --rebase
+   - git push origin master --tags
+
+k8s-deploy-UAT:
+ image: lwolf/kubectl_deployer:0.4
+ dependencies:
+   - update-k8s-scripts
+ tags:
+   - second-option
+ stage: deploy-to-uat
+ environment:
+     name: uat
+ only:
+   - tags
+ script:
+   # Had code the dev url into uat until a real uat comes around
+   - kubectl config set-cluster my-cluster --server=https://192.168.0.105:30443 --insecure-skip-tls-verify=true
+   - kubectl config set-credentials $K8S_DEV_USER --token=$K8S_GITLAB_DEV_TOKEN
+   - kubectl config set-context default-context --namespace=default --cluster=my-cluster --user=$K8S_DEV_USER
+   - kubectl config use-context default-context
+   - kubectl config view
+   - cat nginx-deployment-gitlab.yaml
+   - kubectl apply -f nginx-deployment-gitlab.yaml --as system:serviceaccount:default:$K8S_DEV_USER
+   - kubectl apply -f nginx-service.yaml --as system:serviceaccount:default:$K8S_DEV_USER
+
